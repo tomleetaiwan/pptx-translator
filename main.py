@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import openai
+import json
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from io import BytesIO
@@ -41,8 +42,18 @@ def translate_to_chinese(original_text, model, temperature=0.2, max_tokens=2048)
         temperature=temperature,
         max_tokens=max_tokens
     )
-    chinese_text = response["choices"][0]["message"]["content"]
-    return chinese_text
+    try:         
+        finish_reason = response["choices"][0]["finish_reason"]
+        if finish_reason == "content_filter":
+            print("Content filter triggered. keep the original text.")
+            return original_text
+        else:
+            chinese_text = response["choices"][0]["message"]["content"]
+            return chinese_text
+    except KeyError:
+        print("Error in message chat completions.")
+        print(json.dumps(response)) 
+    
 
 # Function to calculate the total number of shapes in a PowerPoint slide
 def calculate_shape(shape):

@@ -85,5 +85,16 @@ Do not rely on `streamlit run main.py` by itself unless you are sure that `strea
 
 3. Upload the PowerPoint file you want to translate.
 4. Optionally fill in `Optional slide context and translation notes` to describe the deck's topic, terminology, or translation constraints. The app adds this text to the system prompt for every translation request.
-5. Wait for the translation to finish. The app will show a progress bar while it processes the presentation.
-6. Click `Download` to save the translated PowerPoint file.
+5. Optionally fill in `Optional terminology glossary` with one term per line using `source => target`. Matching source terms are forced to the target translation across the deck.
+6. Review `Suggested glossary candidates` to see repeated English terms extracted from the uploaded deck. Select any terms you want to preserve first, then click `Add selected terms to glossary` to append `source => source` draft entries that you can edit.
+7. Click `Check Entra sign-in` before translation. If this machine doesn't already have a cached Microsoft Entra sign-in, the app can open your default browser so you can sign in first.
+8. Review the `Microsoft Entra Status` panel. It shows whether sign-in is ready, whether a browser prompt is expected, whether translation is currently enabled, and what to do next.
+9. Click `Translate PowerPoint` after you finish reviewing the glossary and the Entra sign-in check succeeds. The app will show a progress bar while it processes the presentation.
+10. Click `Download` to save the translated PowerPoint file.
+
+Notes:
+
+- If the same source string appears multiple times in the same upload, the app translates that exact string once and reuses the result across the deck. This improves consistency for repeated sentences and reduces duplicate model calls.
+- Glossary entries are applied after the model returns, so terms such as product names or domain-specific phrases keep the exact target translation you specify.
+- Suggested glossary candidates are heuristic English term matches based on repeated text in the deck. Review them before adding them to the glossary.
+- `Check Entra sign-in` verifies that the app can acquire a Microsoft Entra ID token before translation starts. Azure OpenAI RBAC permissions are still enforced when the translation request is sent.

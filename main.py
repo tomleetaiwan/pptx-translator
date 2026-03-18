@@ -4,7 +4,9 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from importlib.metadata import PackageNotFoundError, version
+from zipfile import BadZipFile, ZipFile
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from packaging.version import Version
@@ -25,13 +27,129 @@ MAX_BATCH_CHARACTERS = 2000
 DEFAULT_REASONING_EFFORT = "minimal"
 # A font with good Traditional Chinese support is needed to prevent missing glyphs after translation.
 TRANSLATED_CHINESE_FONT_NAME = "微軟正黑體"
+AZURE_OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default"
 # This app keeps its own cache key in st.session_state rather than using
 # Streamlit's built-in st.cache_* decorators.
 # Use a neutral version label because this covers any output-affecting change,
 # including translation logic and font-writing behavior.
 # Bump this when output behavior changes so the same upload is reprocessed
 # instead of reusing a cached result from the current session.
-TRANSLATION_CACHE_VERSION = "output-v1"
+TRANSLATION_CACHE_VERSION = "output-v3"
+GLOSSARY_ENTRY_SEPARATOR_PATTERN = re.compile(r"\s*(?:=>|->|→)\s*")
+TERM_CANDIDATE_MIN_OCCURRENCES = 2
+TERM_CANDIDATE_MAX_RESULTS = 40
+TERM_CONNECTOR_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "via",
+    "with",
+}
+TERM_STOPWORDS = TERM_CONNECTOR_WORDS | {
+    "are",
+    "be",
+    "been",
+    "being",
+    "can",
+    "current",
+    "is",
+    "it",
+    "its",
+    "new",
+    "our",
+    "their",
+    "these",
+    "this",
+    "those",
+    "use",
+    "used",
+    "using",
+    "will",
+    "your",
+}
+TERM_HEADWORDS = {
+    "agent",
+    "agents",
+    "api",
+    "apis",
+    "assistant",
+    "assistants",
+    "automation",
+    "capability",
+    "capabilities",
+    "cloud",
+    "context",
+    "copilot",
+    "dashboard",
+    "data",
+    "database",
+    "engine",
+    "feature",
+    "features",
+    "foundation",
+    "framework",
+    "generation",
+    "index",
+    "insight",
+    "insights",
+    "integration",
+    "interface",
+    "language",
+    "model",
+    "models",
+    "platform",
+    "process",
+    "processes",
+    "product",
+    "products",
+    "protocol",
+    "report",
+    "reports",
+    "sdk",
+    "service",
+    "services",
+    "solution",
+    "solutions",
+    "stack",
+    "storage",
+    "studio",
+    "system",
+    "systems",
+    "tool",
+    "tools",
+    "workflow",
+    "workflows",
+}
+TERM_SUFFIXES = (
+    "tion",
+    "sion",
+    "ment",
+    "ness",
+    "ity",
+    "ism",
+    "ics",
+    "ware",
+    "graphy",
+    "ology",
+)
+CAPITALIZED_TERM_CANDIDATE_PATTERN = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9+]*(?:-[A-Za-z0-9+]+)*|[A-Z]{2,})(?:\s+(?:(?:of|for|and|to|in|on|by|with|the|a|an|or|via|from)\s+)?(?:[A-Z][A-Za-z0-9+]*(?:-[A-Za-z0-9+]+)*|[A-Z]{2,})){0,3}\b"
+)
+LOWERCASE_TERM_CANDIDATE_PATTERN = re.compile(
+    r"\b[a-z]+(?:-[a-z0-9]+)*(?:\s+[a-z]+(?:-[a-z0-9]+)*){1,3}\b"
+)
+UPPERCASE_TERM_TOKEN_PATTERN = re.compile(r"\b[A-Z]{2,}(?:[A-Z0-9+-]*[A-Z0-9])?\b")
 
 # Different slide text profiles need different translation constraints.
 # Statistics captions read better when kept fragment-like, while source-note rows
@@ -132,11 +250,13 @@ PROTECTED_TEXT_PATTERNS = [
     ("num", re.compile(r"(?:[$€£¥])?\d[\d,.:/-]*(?:[BMKbmk])?%?")),
 ]
 
+
+class InvalidPowerPointFileError(Exception):
+    pass
+
 # Set up the Microsoft Entra ID token provider for authentication
-token_provider = get_bearer_token_provider(
-    DefaultAzureCredential(exclude_interactive_browser_credential=False),
-    "https://cognitiveservices.azure.com/.default",
-)
+entra_credential = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+token_provider = get_bearer_token_provider(entra_credential, AZURE_OPENAI_SCOPE)
 
 # Set up the Streamlit app and OpenAI configuration
 st.set_page_config(page_title="PowerPoint Translator")
@@ -154,6 +274,33 @@ if "translated_file_name" not in st.session_state:
 
 if "translated_debug_info" not in st.session_state:
     st.session_state.translated_debug_info = None
+
+if "term_candidate_file_key" not in st.session_state:
+    st.session_state.term_candidate_file_key = None
+
+if "term_candidate_entries" not in st.session_state:
+    st.session_state.term_candidate_entries = None
+
+if "selected_term_candidates" not in st.session_state:
+    st.session_state.selected_term_candidates = []
+
+if "glossary_builder_message" not in st.session_state:
+    st.session_state.glossary_builder_message = None
+
+if "pending_glossary_lines" not in st.session_state:
+    st.session_state.pending_glossary_lines = None
+
+if "pending_selected_term_candidates_reset" not in st.session_state:
+    st.session_state.pending_selected_term_candidates_reset = False
+
+if "entra_auth_ready" not in st.session_state:
+    st.session_state.entra_auth_ready = False
+
+if "entra_auth_status" not in st.session_state:
+    st.session_state.entra_auth_status = "not_checked"
+
+if "entra_auth_message" not in st.session_state:
+    st.session_state.entra_auth_message = None
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -198,6 +345,86 @@ def build_base_url():
     return None
 
 
+def summarize_auth_error(exc, max_length=360):
+    normalized_message = " ".join(str(exc).split())
+    if not normalized_message:
+        return "Unable to acquire a Microsoft Entra ID token."
+
+    if len(normalized_message) <= max_length:
+        return normalized_message
+
+    return f"{normalized_message[:max_length - 3]}..."
+
+
+def verify_entra_authentication():
+    try:
+        entra_credential.get_token(AZURE_OPENAI_SCOPE)
+    except Exception as exc:
+        st.session_state.entra_auth_ready = False
+        st.session_state.entra_auth_status = "failed"
+        st.session_state.entra_auth_message = (
+            "Microsoft Entra ID sign-in failed or was cancelled. "
+            f"{summarize_auth_error(exc)}"
+        )
+        return False
+
+    st.session_state.entra_auth_ready = True
+    st.session_state.entra_auth_status = "success"
+    st.session_state.entra_auth_message = (
+        "Microsoft Entra ID sign-in verified. You can translate now. "
+        "Azure OpenAI permissions are still checked when the translation request is sent."
+    )
+    return True
+
+
+def show_entra_auth_status_panel():
+    auth_status = st.session_state.entra_auth_status
+    auth_ready = st.session_state.entra_auth_ready
+    auth_message = st.session_state.entra_auth_message
+
+    if auth_status == "success":
+        state_value = "Ready"
+        browser_value = "Not expected"
+        next_step = "Click Translate PowerPoint to start translation."
+        message_type = "success"
+        message_text = auth_message or "Microsoft Entra ID sign-in verified."
+    elif auth_status == "failed":
+        state_value = "Failed"
+        browser_value = "Retry may prompt"
+        next_step = "Click Check Microsoft Entra sign-in again."
+        message_type = "error"
+        message_text = auth_message or "Microsoft Entra ID sign-in failed."
+    else:
+        state_value = "Not checked"
+        browser_value = "Possible"
+        next_step = "Click Check Microsoft Entra sign-in before translating."
+        message_type = "info"
+        message_text = (
+            "The app has not checked Microsoft Entra ID sign-in yet. "
+            "If no cached sign-in is available, the check can open your default browser."
+        )
+
+    with st.container(border=True):
+        st.markdown("**Microsoft Entra ID Sign-inStatus**")
+
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Sign-in State", state_value)
+        metric_columns[1].metric("Browser Sign-In", browser_value)
+        metric_columns[2].metric(
+            "Translate Button",
+            "Enabled" if auth_ready else "Disabled",
+        )
+
+        if message_type == "success":
+            st.success(message_text)
+        elif message_type == "error":
+            st.error(message_text)
+        else:
+            st.info(message_text)
+
+        st.caption(f"Next step: {next_step}")
+
+
 ensure_supported_runtime()
 
 openai_base_url = build_base_url()
@@ -236,7 +463,23 @@ def get_response_content(response):
         return None
 
 
-def find_protected_spans(text, protect_numbers=True):
+def select_non_overlapping_spans(candidate_spans):
+    candidate_spans.sort(key=lambda span: (span[0], -(span[1] - span[0])))
+
+    selected_spans = []
+    current_end = -1
+    for span in candidate_spans:
+        start = span[0]
+        end = span[1]
+        if start < current_end:
+            continue
+        selected_spans.append(span)
+        current_end = end
+
+    return selected_spans
+
+
+def find_protected_spans(text, protect_numbers=True, include_term_protection=True):
     candidate_spans = []
 
     for label, pattern in PROTECTED_TEXT_PATTERNS:
@@ -245,26 +488,21 @@ def find_protected_spans(text, protect_numbers=True):
         for match in pattern.finditer(text):
             candidate_spans.append((match.start(), match.end(), label))
 
-    for match in PROTECTED_TERM_PATTERN.finditer(text):
-        candidate_spans.append((match.start(), match.end(), "term"))
+    if include_term_protection:
+        for match in PROTECTED_TERM_PATTERN.finditer(text):
+            candidate_spans.append((match.start(), match.end(), "term"))
 
-    candidate_spans.sort(key=lambda span: (span[0], -(span[1] - span[0])))
-
-    selected_spans = []
-    current_end = -1
-    for start, end, label in candidate_spans:
-        if start < current_end:
-            continue
-        selected_spans.append((start, end, label))
-        current_end = end
-
-    return selected_spans
+    return select_non_overlapping_spans(candidate_spans)
 
 
-def mask_protected_content(text, protect_numbers=True):
+def mask_protected_content(text, protect_numbers=True, include_term_protection=True):
     # Replace terms like AI, Microsoft, dates, and reference codes with placeholders
     # so the model can translate surrounding language without damaging those tokens.
-    protected_spans = find_protected_spans(text, protect_numbers=protect_numbers)
+    protected_spans = find_protected_spans(
+        text,
+        protect_numbers=protect_numbers,
+        include_term_protection=include_term_protection,
+    )
     if not protected_spans:
         return text, {}
 
@@ -293,6 +531,366 @@ def restore_protected_content(text, replacements):
 
 def contains_placeholder_tokens(text):
     return bool(PLACEHOLDER_TOKEN_PATTERN.search(text))
+
+
+def normalize_term_candidate(term):
+    return " ".join(term.split())
+
+
+def canonicalize_term_candidate(term):
+    return normalize_term_candidate(term).casefold()
+
+
+def trim_term_candidate_tokens(tokens):
+    start_index = 0
+    end_index = len(tokens)
+
+    while start_index < end_index and tokens[start_index].casefold() in TERM_CONNECTOR_WORDS:
+        start_index += 1
+
+    while end_index > start_index and tokens[end_index - 1].casefold() in TERM_CONNECTOR_WORDS:
+        end_index -= 1
+
+    return tokens[start_index:end_index]
+
+
+def looks_like_technical_headword(token):
+    lower_token = token.casefold()
+    if lower_token in TERM_HEADWORDS:
+        return True
+
+    return any(lower_token.endswith(suffix) for suffix in TERM_SUFFIXES)
+
+
+def prepare_term_candidate(candidate):
+    normalized_candidate = normalize_term_candidate(candidate)
+    if not normalized_candidate:
+        return None
+
+    tokens = trim_term_candidate_tokens(normalized_candidate.split())
+    if not tokens:
+        return None
+
+    normalized_candidate = " ".join(tokens)
+    lower_tokens = [token.casefold() for token in tokens]
+
+    if len(tokens) == 1:
+        token = tokens[0]
+        lower_token = lower_tokens[0]
+        if lower_token in TERM_STOPWORDS:
+            return None
+        if token.isupper():
+            return normalized_candidate
+        if any(character.isdigit() for character in token) or "-" in token:
+            return normalized_candidate
+        if token[:1].isupper() and len(token) >= 4:
+            return normalized_candidate
+        return None
+
+    if all(lower_token in TERM_STOPWORDS for lower_token in lower_tokens):
+        return None
+
+    has_distinctive_token = any(
+        token.isupper()
+        or token[:1].isupper()
+        or "-" in token
+        or any(character.isdigit() for character in token)
+        for token in tokens
+    )
+    if has_distinctive_token:
+        return normalized_candidate
+
+    if looks_like_technical_headword(tokens[-1]):
+        return normalized_candidate
+
+    return None
+
+
+def extract_term_candidates_from_text(text):
+    normalized_text = normalize_term_candidate(text)
+    if not normalized_text:
+        return []
+
+    candidates = []
+    seen_candidates = set()
+
+    for pattern in (
+        CAPITALIZED_TERM_CANDIDATE_PATTERN,
+        LOWERCASE_TERM_CANDIDATE_PATTERN,
+        UPPERCASE_TERM_TOKEN_PATTERN,
+    ):
+        for match in pattern.finditer(normalized_text):
+            candidate = prepare_term_candidate(match.group(0))
+            if not candidate:
+                continue
+
+            candidate_key = canonicalize_term_candidate(candidate)
+            if candidate_key in seen_candidates:
+                continue
+
+            seen_candidates.add(candidate_key)
+            candidates.append(candidate)
+
+    return candidates
+
+
+def load_powerpoint_presentation(uploaded_bytes):
+    try:
+        with ZipFile(BytesIO(uploaded_bytes)) as archive:
+            archive_entries = set(archive.namelist())
+    except BadZipFile as exc:
+        raise InvalidPowerPointFileError(
+            "The uploaded file is not a valid PowerPoint file. Please upload a presentation saved in .pptx format."
+        ) from exc
+
+    required_entries = {"[Content_Types].xml", "_rels/.rels", "ppt/presentation.xml"}
+    if not required_entries.issubset(archive_entries):
+        raise InvalidPowerPointFileError(
+            "The uploaded file is not a valid .pptx PowerPoint presentation. Please export or save it as .pptx and try again."
+        )
+
+    try:
+        return Presentation(BytesIO(uploaded_bytes))
+    except (BadZipFile, KeyError, ValueError) as exc:
+        raise InvalidPowerPointFileError(
+            "The uploaded PowerPoint file could not be opened. Please re-save it as .pptx in PowerPoint and try again."
+        ) from exc
+
+
+def extract_terminology_candidates(uploaded_bytes):
+    presentation = load_powerpoint_presentation(uploaded_bytes)
+    text_targets, _ = collect_translation_targets(presentation)
+    candidate_counts = Counter()
+    display_variants = {}
+
+    for target in text_targets:
+        for candidate in extract_term_candidates_from_text(target.text):
+            candidate_key = canonicalize_term_candidate(candidate)
+            candidate_counts[candidate_key] += 1
+
+            variant_counter = display_variants.get(candidate_key)
+            if variant_counter is None:
+                variant_counter = Counter()
+                display_variants[candidate_key] = variant_counter
+            variant_counter[candidate] += 1
+
+    terminology_candidates = []
+    for candidate_key, occurrence_count in candidate_counts.items():
+        if occurrence_count < TERM_CANDIDATE_MIN_OCCURRENCES:
+            continue
+
+        display_term = display_variants[candidate_key].most_common(1)[0][0]
+        terminology_candidates.append(
+            {
+                "term": display_term,
+                "count": occurrence_count,
+                "word_count": len(display_term.split()),
+            }
+        )
+
+    terminology_candidates.sort(
+        key=lambda item: (-item["count"], -item["word_count"], item["term"].casefold())
+    )
+    return terminology_candidates[:TERM_CANDIDATE_MAX_RESULTS]
+
+
+def build_upload_content_key(uploaded_bytes):
+    return hashlib.sha256(uploaded_bytes).hexdigest()
+
+
+def build_glossary_lines_from_terms(selected_terms, glossary_entries):
+    existing_term_keys = {
+        canonicalize_term_candidate(entry["source"])
+        for entry in glossary_entries
+    }
+    glossary_lines = []
+    added_terms = []
+
+    for term in selected_terms:
+        normalized_term = normalize_term_candidate(term)
+        term_key = canonicalize_term_candidate(normalized_term)
+        if term_key in existing_term_keys:
+            continue
+
+        glossary_lines.append(f"{normalized_term} => {normalized_term}")
+        added_terms.append(normalized_term)
+        existing_term_keys.add(term_key)
+
+    return glossary_lines, added_terms
+
+
+def append_glossary_lines(glossary_text, glossary_lines):
+    if not glossary_lines:
+        return glossary_text
+
+    stripped_glossary_text = glossary_text.rstrip()
+    if not stripped_glossary_text:
+        return "\n".join(glossary_lines)
+
+    return f"{stripped_glossary_text}\n" + "\n".join(glossary_lines)
+
+
+def apply_pending_glossary_updates():
+    pending_glossary_lines = st.session_state.pending_glossary_lines
+    if not pending_glossary_lines:
+        return
+
+    current_glossary_text = st.session_state.get("translation_glossary_input", "")
+    st.session_state.translation_glossary_input = append_glossary_lines(
+        current_glossary_text,
+        pending_glossary_lines,
+    )
+    st.session_state.pending_glossary_lines = None
+
+
+def prepare_selected_term_candidates(available_terms):
+    if st.session_state.pending_selected_term_candidates_reset:
+        st.session_state.selected_term_candidates = []
+        st.session_state.pending_selected_term_candidates_reset = False
+        return
+
+    available_term_set = set(available_terms)
+    current_selection = st.session_state.get("selected_term_candidates", [])
+    filtered_selection = [term for term in current_selection if term in available_term_set]
+    if filtered_selection != current_selection:
+        st.session_state.selected_term_candidates = filtered_selection
+
+
+def parse_translation_glossary(glossary_text):
+    glossary_entries = []
+    seen_sources = {}
+
+    for line_number, raw_line in enumerate(glossary_text.splitlines(), start=1):
+        stripped_line = raw_line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+
+        parts = GLOSSARY_ENTRY_SEPARATOR_PATTERN.split(stripped_line, maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Glossary line {line_number} must use 'source => target' format."
+            )
+
+        source_text = parts[0].strip()
+        target_text = parts[1].strip()
+        if not source_text or not target_text:
+            raise ValueError(
+                f"Glossary line {line_number} must include both a source term and a target translation."
+            )
+
+        previous_line_number = seen_sources.get(source_text)
+        if previous_line_number is not None:
+            raise ValueError(
+                f"Glossary term '{source_text}' is defined more than once (lines {previous_line_number} and {line_number})."
+            )
+
+        seen_sources[source_text] = line_number
+        glossary_entries.append({"source": source_text, "target": target_text})
+
+    return glossary_entries
+
+
+def normalize_translation_glossary(glossary_entries):
+    if not glossary_entries:
+        return ""
+
+    normalized_pairs = sorted(
+        (entry["source"], entry["target"]) for entry in glossary_entries
+    )
+    return "\n".join(
+        f"{source_text} => {target_text}"
+        for source_text, target_text in normalized_pairs
+    )
+
+
+def find_glossary_spans(text, glossary_entries):
+    candidate_spans = []
+
+    for glossary_index, entry in enumerate(glossary_entries):
+        source_text = entry["source"]
+        search_start = 0
+        while True:
+            match_start = text.find(source_text, search_start)
+            if match_start == -1:
+                break
+
+            match_end = match_start + len(source_text)
+            candidate_spans.append((match_start, match_end, glossary_index))
+            search_start = match_end
+
+    return select_non_overlapping_spans(candidate_spans)
+
+
+def mask_builtin_term_placeholders(text):
+    term_spans = [
+        (match.start(), match.end(), "term")
+        for match in PROTECTED_TERM_PATTERN.finditer(text)
+    ]
+    term_spans = select_non_overlapping_spans(term_spans)
+    if not term_spans:
+        return text, {}
+
+    masked_parts = []
+    replacements = {}
+    last_end = 0
+
+    for placeholder_index, (start, end, label) in enumerate(term_spans):
+        placeholder = f"[[{label.upper()}_{placeholder_index}]]"
+        masked_parts.append(text[last_end:start])
+        masked_parts.append(placeholder)
+        replacements[placeholder] = text[start:end]
+        last_end = end
+
+    masked_parts.append(text[last_end:])
+    return "".join(masked_parts), replacements
+
+
+def mask_glossary_terms(text, glossary_entries):
+    if not glossary_entries:
+        return text, {}
+
+    glossary_spans = find_glossary_spans(text, glossary_entries)
+    if not glossary_spans:
+        return text, {}
+
+    masked_parts = []
+    replacements = {}
+    last_end = 0
+
+    for placeholder_index, (start, end, glossary_index) in enumerate(glossary_spans):
+        placeholder = f"[[GLOSSARY_{placeholder_index}]]"
+        masked_parts.append(text[last_end:start])
+        masked_parts.append(placeholder)
+        replacements[placeholder] = glossary_entries[glossary_index]["target"]
+        last_end = end
+
+    masked_parts.append(text[last_end:])
+    return "".join(masked_parts), replacements
+
+
+def mask_text_for_translation(text, glossary_entries, protect_numbers=True):
+    # Protect URLs and numeric strings first, then freeze user-defined glossary
+    # terms, and finally protect built-in literal product names.
+    masked_text, protected_replacements = mask_protected_content(
+        text,
+        protect_numbers=protect_numbers,
+        include_term_protection=False,
+    )
+    masked_text, glossary_replacements = mask_glossary_terms(masked_text, glossary_entries)
+    masked_text, term_replacements = mask_builtin_term_placeholders(masked_text)
+
+    return masked_text, protected_replacements, glossary_replacements, term_replacements
+
+
+def restore_translated_text(
+    translated_text,
+    protected_replacements,
+    glossary_replacements,
+    term_replacements,
+):
+    restored_text = restore_protected_content(translated_text, term_replacements)
+    restored_text = restore_protected_content(restored_text, glossary_replacements)
+    return restore_protected_content(restored_text, protected_replacements)
 
 
 def is_standalone_metric_text(text):
@@ -330,6 +928,15 @@ def classify_text(text):
     return "general"
 
 
+def build_translation_memory_key(text, text_profile=None):
+    if text_profile is None:
+        text_profile = classify_text(text)
+
+    # Reuse only exact source strings so repeated sentences can share the same
+    # translation without collapsing formatting-sensitive variants together.
+    return text_profile, text
+
+
 def normalize_translation_guidance(translation_guidance):
     return translation_guidance.replace("\r\n", "\n").strip()
 
@@ -354,10 +961,18 @@ def translate_text_with_prompt(
     user_prompt_template,
     max_completion_tokens=512,
     protect_numbers=True,
+    glossary_entries=None,
 ):
     # Single-item translation is used both directly and as a safe fallback when
     # batch output is malformed or leaks placeholders back into the result.
-    masked_text, replacements = mask_protected_content(original_text, protect_numbers=protect_numbers)
+    if glossary_entries is None:
+        glossary_entries = []
+
+    masked_text, protected_replacements, glossary_replacements, term_replacements = mask_text_for_translation(
+        original_text,
+        glossary_entries,
+        protect_numbers=protect_numbers,
+    )
 
     response = completion_with_backoff(
         model=model,
@@ -376,17 +991,25 @@ def translate_text_with_prompt(
     if not chinese_text:
         return original_text
 
-    restored_text = restore_protected_content(chinese_text, replacements)
+    restored_text = restore_translated_text(
+        chinese_text,
+        protected_replacements,
+        glossary_replacements,
+        term_replacements,
+    )
     if contains_placeholder_tokens(restored_text):
         return original_text
 
     return restored_text
 
 
-def translate_to_chinese(original_text, model, max_completion_tokens=512, translation_guidance=""):
+def translate_to_chinese(original_text, model, max_completion_tokens=512, translation_guidance="", glossary_entries=None):
     text_profile = classify_text(original_text)
     if text_profile in {"empty", "metric"}:
         return original_text
+
+    if glossary_entries is None:
+        glossary_entries = []
 
     # "source" means citation/source-note style text; "stat" means short KPI or
     # infographic caption text that should stay fragment-like and concise.
@@ -398,6 +1021,7 @@ def translate_to_chinese(original_text, model, max_completion_tokens=512, transl
             SOURCE_NOTE_USER_PROMPT_TEMPLATE,
             max_completion_tokens=max_completion_tokens,
             protect_numbers=False,
+            glossary_entries=glossary_entries,
         )
 
     if text_profile == "stat":
@@ -408,6 +1032,7 @@ def translate_to_chinese(original_text, model, max_completion_tokens=512, transl
             STAT_CAPTION_USER_PROMPT_TEMPLATE,
             max_completion_tokens=max_completion_tokens,
             protect_numbers=False,
+            glossary_entries=glossary_entries,
         )
 
     return translate_text_with_prompt(
@@ -417,6 +1042,7 @@ def translate_to_chinese(original_text, model, max_completion_tokens=512, transl
         TRANSLATION_USER_PROMPT_TEMPLATE,
         max_completion_tokens=max_completion_tokens,
         protect_numbers=True,
+        glossary_entries=glossary_entries,
     )
 
 
@@ -444,9 +1070,21 @@ def parse_batch_translation_response(content, expected_count):
     return payload
 
 
-def translate_batch(texts, model, max_completion_tokens=3072, translation_guidance=""):
+def translate_batch(
+    texts,
+    model,
+    max_completion_tokens=3072,
+    translation_guidance="",
+    translation_memory=None,
+    glossary_entries=None,
+):
     if not texts:
         return [], False
+
+    if translation_memory is None:
+        translation_memory = {}
+    if glossary_entries is None:
+        glossary_entries = []
 
     translation_results = [None] * len(texts)
     used_fallback = False
@@ -461,48 +1099,76 @@ def translate_batch(texts, model, max_completion_tokens=3072, translation_guidan
         if text_profile in {"empty", "metric"}:
             translation_results[index] = text
             continue
-        grouped_texts[text_profile].append((index, text))
+
+        cache_key = build_translation_memory_key(text, text_profile=text_profile)
+        cached_translation = translation_memory.get(cache_key)
+        if cached_translation is not None:
+            translation_results[index] = cached_translation
+            continue
+
+        grouped_texts[text_profile].append((index, text, cache_key))
 
     for text_profile, items in grouped_texts.items():
         if not items:
             continue
 
+        unique_items = []
+        cache_key_to_item_indices = {}
+        unique_item_cache_keys = {}
+
+        for item_index, text, cache_key in items:
+            existing_item_indices = cache_key_to_item_indices.get(cache_key)
+            if existing_item_indices is None:
+                cache_key_to_item_indices[cache_key] = [item_index]
+                unique_items.append((item_index, text))
+                unique_item_cache_keys[item_index] = cache_key
+                continue
+
+            existing_item_indices.append(item_index)
+
         # Batch only similar text profiles together so one prompt does not need to
         # simultaneously handle KPIs, citation rows, and normal body copy.
         if text_profile == "general":
             translated_group, group_used_fallback = translate_text_group(
-                items,
+                unique_items,
                 model,
                 build_system_prompt(BATCH_TRANSLATION_SYSTEM_PROMPT, translation_guidance),
                 BATCH_TRANSLATION_USER_PROMPT_TEMPLATE,
                 max_completion_tokens=max_completion_tokens,
                 protect_numbers=True,
                 translation_guidance=translation_guidance,
+                glossary_entries=glossary_entries,
             )
         elif text_profile == "stat":
             translated_group, group_used_fallback = translate_text_group(
-                items,
+                unique_items,
                 model,
                 build_system_prompt(STAT_BATCH_TRANSLATION_SYSTEM_PROMPT, translation_guidance),
                 STAT_CAPTION_BATCH_USER_PROMPT_TEMPLATE,
                 max_completion_tokens=max_completion_tokens,
                 protect_numbers=False,
                 translation_guidance=translation_guidance,
+                glossary_entries=glossary_entries,
             )
         else:
             translated_group, group_used_fallback = translate_text_group(
-                items,
+                unique_items,
                 model,
                 build_system_prompt(SOURCE_NOTE_BATCH_TRANSLATION_SYSTEM_PROMPT, translation_guidance),
                 SOURCE_NOTE_BATCH_USER_PROMPT_TEMPLATE,
                 max_completion_tokens=max_completion_tokens,
                 protect_numbers=False,
                 translation_guidance=translation_guidance,
+                glossary_entries=glossary_entries,
             )
 
         used_fallback = used_fallback or group_used_fallback
         for item_index, translated_text in translated_group:
-            translation_results[item_index] = translated_text
+            cache_key = unique_item_cache_keys[item_index]
+            translation_memory[cache_key] = translated_text
+
+            for resolved_index in cache_key_to_item_indices[cache_key]:
+                translation_results[resolved_index] = translated_text
 
     return translation_results, used_fallback
 
@@ -515,20 +1181,32 @@ def translate_text_group(
     max_completion_tokens=3072,
     protect_numbers=True,
     translation_guidance="",
+    glossary_entries=None,
 ):
     # Build one masked JSON payload for the model, then restore protected tokens
     # item-by-item after the batch response comes back.
+    if glossary_entries is None:
+        glossary_entries = []
+
     masked_texts = []
-    replacement_maps = []
+    protected_replacement_maps = []
+    glossary_replacement_maps = []
+    term_replacement_maps = []
     original_texts = []
     item_indices = []
 
     for item_index, text in items:
-        masked_text, replacements = mask_protected_content(text, protect_numbers=protect_numbers)
+        masked_text, protected_replacements, glossary_replacements, term_replacements = mask_text_for_translation(
+            text,
+            glossary_entries,
+            protect_numbers=protect_numbers,
+        )
         item_indices.append(item_index)
         original_texts.append(text)
         masked_texts.append(masked_text)
-        replacement_maps.append(replacements)
+        protected_replacement_maps.append(protected_replacements)
+        glossary_replacement_maps.append(glossary_replacements)
+        term_replacement_maps.append(term_replacements)
 
     response = completion_with_backoff(
         model=model,
@@ -548,7 +1226,15 @@ def translate_text_group(
     content = get_response_content(response)
     if not content:
         return [
-            (item_index, translate_to_chinese(original_text, model, translation_guidance=translation_guidance))
+            (
+                item_index,
+                translate_to_chinese(
+                    original_text,
+                    model,
+                    translation_guidance=translation_guidance,
+                    glossary_entries=glossary_entries,
+                ),
+            )
             for item_index, original_text in items
         ], True
 
@@ -556,16 +1242,31 @@ def translate_text_group(
         translated_texts = parse_batch_translation_response(content, len(items))
         restored_results = []
 
-        for item_index, original_text, translated_text, replacements in zip(
+        for item_index, original_text, translated_text, protected_replacements, glossary_replacements, term_replacements in zip(
             item_indices,
             original_texts,
             translated_texts,
-            replacement_maps,
+            protected_replacement_maps,
+            glossary_replacement_maps,
+            term_replacement_maps,
         ):
-            restored_text = restore_protected_content(translated_text, replacements)
+            restored_text = restore_translated_text(
+                translated_text,
+                protected_replacements,
+                glossary_replacements,
+                term_replacements,
+            )
             if contains_placeholder_tokens(restored_text):
                 restored_results.append(
-                    (item_index, translate_to_chinese(original_text, model, translation_guidance=translation_guidance))
+                    (
+                        item_index,
+                        translate_to_chinese(
+                            original_text,
+                            model,
+                            translation_guidance=translation_guidance,
+                            glossary_entries=glossary_entries,
+                        ),
+                    )
                 )
             else:
                 restored_results.append((item_index, restored_text))
@@ -573,7 +1274,15 @@ def translate_text_group(
         return restored_results, False
     except (json.JSONDecodeError, ValueError):
         return [
-            (item_index, translate_to_chinese(original_text, model, translation_guidance=translation_guidance))
+            (
+                item_index,
+                translate_to_chinese(
+                    original_text,
+                    model,
+                    translation_guidance=translation_guidance,
+                    glossary_entries=glossary_entries,
+                ),
+            )
             for item_index, original_text in items
         ], True
 
@@ -646,13 +1355,15 @@ def summarize_text(text, max_length=80):
     return f"{normalized_text[:max_length - 3]}..."
 
 
-def build_translation_cache_key(uploaded_bytes, translation_guidance):
+def build_translation_cache_key(uploaded_bytes, translation_guidance, glossary_entries):
     cache_digest = hashlib.sha256()
     cache_digest.update(uploaded_bytes)
     cache_digest.update(b"\0")
     cache_digest.update(TRANSLATION_CACHE_VERSION.encode("utf-8"))
     cache_digest.update(b"\0")
     cache_digest.update(normalize_translation_guidance(translation_guidance).encode("utf-8"))
+    cache_digest.update(b"\0")
+    cache_digest.update(normalize_translation_glossary(glossary_entries).encode("utf-8"))
     return cache_digest.hexdigest()
 
 
@@ -733,6 +1444,10 @@ def collect_translation_targets(presentation):
         "shape_count": 0,
         "container_shape_count": 0,
         "text_target_count": 0,
+        "unique_text_target_count": 0,
+        "reused_text_target_count": 0,
+        "passthrough_text_target_count": 0,
+        "glossary_term_count": 0,
         "batch_count": 0,
         "fallback_batch_count": 0,
         "translated_item_count": 0,
@@ -766,6 +1481,25 @@ def collect_translation_targets(presentation):
 
     debug_info["text_target_count"] = len(text_targets)
 
+    unique_translation_keys = set()
+    passthrough_text_target_count = 0
+    for target in text_targets:
+        text_profile = classify_text(target.text)
+        if text_profile in {"empty", "metric"}:
+            passthrough_text_target_count += 1
+            continue
+
+        unique_translation_keys.add(
+            build_translation_memory_key(target.text, text_profile=text_profile)
+        )
+
+    debug_info["unique_text_target_count"] = len(unique_translation_keys)
+    debug_info["passthrough_text_target_count"] = passthrough_text_target_count
+    debug_info["reused_text_target_count"] = max(
+        0,
+        len(text_targets) - passthrough_text_target_count - len(unique_translation_keys),
+    )
+
     for batch_number, batch in enumerate(build_translation_batches(text_targets), start=1):
         batch_texts = [target.text for target in batch]
         debug_info["batches"].append(
@@ -782,14 +1516,26 @@ def collect_translation_targets(presentation):
 
 
 def analyze_presentation(uploaded_bytes):
-    presentation = Presentation(BytesIO(uploaded_bytes))
+    presentation = load_powerpoint_presentation(uploaded_bytes)
     _, debug_info = collect_translation_targets(presentation)
     return debug_info
 
 
-def translate_presentation(uploaded_bytes, model, progress_bar, status_placeholder, translation_guidance=""):
-    presentation = Presentation(BytesIO(uploaded_bytes))
+def translate_presentation(
+    uploaded_bytes,
+    model,
+    progress_bar,
+    status_placeholder,
+    translation_guidance="",
+    glossary_entries=None,
+):
+    presentation = load_powerpoint_presentation(uploaded_bytes)
     text_targets, debug_info = collect_translation_targets(presentation)
+    translation_memory = {}
+    if glossary_entries is None:
+        glossary_entries = []
+
+    debug_info["glossary_term_count"] = len(glossary_entries)
 
     total_text_items = len(text_targets)
     if total_text_items == 0:
@@ -799,7 +1545,23 @@ def translate_presentation(uploaded_bytes, model, progress_bar, status_placehold
         presentation.save(buffer)
         return buffer.getvalue(), debug_info
 
-    status_placeholder.info(f"Found {total_text_items} text items. Starting translation...")
+    unique_text_count = debug_info["unique_text_target_count"]
+    reused_text_count = debug_info["reused_text_target_count"]
+    if reused_text_count > 0 and glossary_entries:
+        status_placeholder.info(
+            f"Found {total_text_items} text items. Applying {len(glossary_entries)} glossary terms and reusing repeated strings so only {unique_text_count} unique text items need translation..."
+        )
+    elif glossary_entries:
+        status_placeholder.info(
+            f"Found {total_text_items} text items. Applying {len(glossary_entries)} glossary terms before translation..."
+        )
+    elif reused_text_count > 0:
+        status_placeholder.info(
+            f"Found {total_text_items} text items. Reusing repeated strings so only {unique_text_count} unique text items need translation..."
+        )
+    else:
+        status_placeholder.info(f"Found {total_text_items} text items. Starting translation...")
+
     translated_items = 0
 
     for batch in build_translation_batches(text_targets):
@@ -808,6 +1570,8 @@ def translate_presentation(uploaded_bytes, model, progress_bar, status_placehold
             batch_texts,
             model,
             translation_guidance=translation_guidance,
+            translation_memory=translation_memory,
+            glossary_entries=glossary_entries,
         )
         if used_fallback:
             debug_info["fallback_batch_count"] += 1
@@ -843,18 +1607,53 @@ def reset_translation_state():
     st.session_state.translated_debug_info = None
 
 
+def reset_term_candidate_state():
+    st.session_state.term_candidate_file_key = None
+    st.session_state.term_candidate_entries = None
+    st.session_state.selected_term_candidates = []
+    st.session_state.glossary_builder_message = None
+    st.session_state.pending_glossary_lines = None
+    st.session_state.pending_selected_term_candidates_reset = False
+
+
 def show_download_button(file_bytes, file_name):
-    st.download_button(         
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDownloadButton"] > button {
+            background-color: #15803d !important;
+            border-color: #15803d !important;
+            color: #ffffff !important;
+        }
+
+        div[data-testid="stDownloadButton"] > button:hover {
+            background-color: #166534 !important;
+            border-color: #166534 !important;
+            color: #ffffff !important;
+        }
+
+        div[data-testid="stDownloadButton"] > button:active {
+            background-color: #14532d !important;
+            border-color: #14532d !important;
+            color: #ffffff !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.download_button(
         label="Download",
         data=file_bytes,
         file_name=file_name,
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ) 
+        type="primary",
+        use_container_width=True,
+    )
 
 
 def show_debug_panel(debug_info, used_cached_result):
     with st.expander("Debug details", expanded=True):
-        st.caption("Use this panel to confirm how many shapes and text targets were scanned before translation.")
+        st.caption("Use this panel to confirm how many shapes and text targets were scanned before translation, including repeated strings that can be reused.")
 
         metric_columns = st.columns(4)
         metric_columns[0].metric("Slides", debug_info["slide_count"])
@@ -862,10 +1661,16 @@ def show_debug_panel(debug_info, used_cached_result):
         metric_columns[2].metric("Text Items", debug_info["text_target_count"])
         metric_columns[3].metric("Batches", debug_info["batch_count"])
 
-        metric_columns = st.columns(3)
+        metric_columns = st.columns(5)
         metric_columns[0].metric("Container Shapes", debug_info["container_shape_count"])
-        metric_columns[1].metric("Fallback Batches", debug_info["fallback_batch_count"])
-        metric_columns[2].metric("Used Cache", "Yes" if used_cached_result else "No")
+        metric_columns[1].metric("Unique Texts", debug_info["unique_text_target_count"])
+        metric_columns[2].metric("Reused Texts", debug_info["reused_text_target_count"])
+        metric_columns[3].metric("Fallback Batches", debug_info["fallback_batch_count"])
+        metric_columns[4].metric("Used Cache", "Yes" if used_cached_result else "No")
+
+        metric_columns = st.columns(2)
+        metric_columns[0].metric("Passthrough Texts", debug_info["passthrough_text_target_count"])
+        metric_columns[1].metric("Glossary Terms", debug_info["glossary_term_count"])
 
         st.write("Slide scan summary")
         st.dataframe(debug_info["slides"], width="stretch")
@@ -888,23 +1693,156 @@ translation_guidance = st.text_area(
     ),
     help="This text is added to the system prompt for every translation request.",
 )
+apply_pending_glossary_updates()
+translation_glossary = st.text_area(
+    "Optional terminology glossary",
+    placeholder=(
+        "Example:\n"
+        "Copilot Studio => Copilot Studio\n"
+        "agentic workflow => 代理式工作流程\n"
+        "retrieval-augmented generation => 檢索增強生成"
+    ),
+    help="One term per line using 'source => target'. Matching source terms are replaced with the target translation after the model returns.",
+    key="translation_glossary_input",
+)
 uploaded_file = st.file_uploader("Upload a PowerPoint file", type=["pptx"])
 
 if uploaded_file is None:
     reset_translation_state()
+    reset_term_candidate_state()
 else:
+    try:
+        glossary_entries = parse_translation_glossary(translation_glossary)
+    except ValueError as exc:
+        reset_translation_state()
+        st.error(f"Glossary format error: {exc}")
+        st.stop()
+
     uploaded_bytes = uploaded_file.getvalue()
+    try:
+        load_powerpoint_presentation(uploaded_bytes)
+    except InvalidPowerPointFileError as exc:
+        reset_translation_state()
+        reset_term_candidate_state()
+        st.error(str(exc))
+        st.stop()
+
+    upload_content_key = build_upload_content_key(uploaded_bytes)
+    if (
+        st.session_state.term_candidate_file_key != upload_content_key
+        or st.session_state.term_candidate_entries is None
+    ):
+        st.session_state.term_candidate_file_key = upload_content_key
+        st.session_state.term_candidate_entries = extract_terminology_candidates(uploaded_bytes)
+        st.session_state.selected_term_candidates = []
+
+    if st.session_state.glossary_builder_message:
+        st.info(st.session_state.glossary_builder_message)
+        st.session_state.glossary_builder_message = None
+
+    existing_glossary_term_keys = {
+        canonicalize_term_candidate(entry["source"])
+        for entry in glossary_entries
+    }
+    available_term_candidates = [
+        candidate
+        for candidate in st.session_state.term_candidate_entries
+        if canonicalize_term_candidate(candidate["term"]) not in existing_glossary_term_keys
+    ]
+
+    with st.expander("Suggested glossary candidates", expanded=bool(available_term_candidates)):
+        st.caption(
+            "The candidate list is heuristic. Selected terms are added as 'source => source' glossary lines so you can edit the right-hand side before translating."
+        )
+
+        if available_term_candidates:
+            candidate_count_map = {
+                candidate["term"]: candidate["count"]
+                for candidate in available_term_candidates
+            }
+            candidate_options = [candidate["term"] for candidate in available_term_candidates]
+            prepare_selected_term_candidates(candidate_options)
+            selected_terms = st.multiselect(
+                "Repeated English term candidates",
+                options=candidate_options,
+                format_func=lambda term: f"{term} ({candidate_count_map[term]} occurrences)",
+                placeholder="Select terms to add to the glossary",
+                key="selected_term_candidates",
+            )
+            st.caption(
+                f"Showing {len(available_term_candidates)} repeated English term candidates found in this deck."
+            )
+
+            if st.button("Add selected terms to glossary"):
+                if not selected_terms:
+                    st.session_state.pending_glossary_lines = None
+                    st.session_state.glossary_builder_message = "No terms were added because nothing was selected."
+                else:
+                    glossary_lines, added_terms = build_glossary_lines_from_terms(
+                        selected_terms,
+                        glossary_entries,
+                    )
+                    if added_terms:
+                        st.session_state.pending_glossary_lines = glossary_lines
+                        st.session_state.glossary_builder_message = (
+                            f"Added {len(added_terms)} terms to the glossary draft."
+                        )
+                    else:
+                        st.session_state.pending_glossary_lines = None
+                        st.session_state.glossary_builder_message = (
+                            "No new terms were added because the selected terms are already in the glossary."
+                        )
+
+                st.session_state.pending_selected_term_candidates_reset = True
+                st.rerun()
+        else:
+            st.caption("No repeated English term candidates were found outside the current glossary.")
+
     # Include translation guidance in the hash so changing the prompt context
     # reprocesses the same upload instead of returning a stale cached result.
-    uploaded_file_key = build_translation_cache_key(uploaded_bytes, translation_guidance)
+    uploaded_file_key = build_translation_cache_key(
+        uploaded_bytes,
+        translation_guidance,
+        glossary_entries,
+    )
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
     used_cached_result = (
         st.session_state.translated_file_key == uploaded_file_key
         and st.session_state.translated_file_bytes is not None
     )
+    translate_button_label = "Retranslate PowerPoint" if used_cached_result else "Translate PowerPoint"
+    action_columns = st.columns(2)
+    with action_columns[0]:
+        auth_check_requested = st.button(
+            "Check Microsoft Entra ID sign-in",
+            use_container_width=True,
+            help=(
+                "Try to acquire a Microsoft Entra ID token now. If no cached sign-in is "
+                "available, your default browser may open so you can sign in before translation starts."
+            ),
+        )
 
-    if not used_cached_result:
+    if auth_check_requested:
+        with st.spinner("Checking Microsoft Entra ID sign-in status..."):
+            verify_entra_authentication()
+
+    with action_columns[1]:
+        translation_requested = st.button(
+            translate_button_label,
+            type="primary",
+            use_container_width=True,
+            disabled=not st.session_state.entra_auth_ready,
+            help=(
+                "Check Entra sign-in first so the app can prompt for Microsoft Entra authentication before translation."
+                if not st.session_state.entra_auth_ready
+                else None
+            ),
+        )
+
+    show_entra_auth_status_panel()
+
+    if translation_requested:
         progress_bar = progress_placeholder.progress(0.0)
         try:
             translated_file_bytes, debug_info = translate_presentation(
@@ -913,6 +1851,7 @@ else:
                 progress_bar,
                 status_placeholder,
                 translation_guidance=translation_guidance,
+                glossary_entries=glossary_entries,
             )
         except Exception as exc:
             progress_placeholder.empty()
@@ -923,17 +1862,36 @@ else:
         st.session_state.translated_file_key = uploaded_file_key
         st.session_state.translated_file_bytes = translated_file_bytes
         st.session_state.translated_debug_info = debug_info
-    elif st.session_state.translated_debug_info is None:
+        used_cached_result = False
+    elif used_cached_result and st.session_state.translated_debug_info is None:
         st.session_state.translated_debug_info = analyze_presentation(uploaded_bytes)
 
-    st.session_state.translated_file_name = build_output_filename(uploaded_file.name)
-    progress_placeholder.progress(1.0)
-    status_placeholder.success("Translation complete.")
+    current_result_available = (
+        st.session_state.translated_file_key == uploaded_file_key
+        and st.session_state.translated_file_bytes is not None
+    )
+    if current_result_available and st.session_state.translated_debug_info is not None:
+        st.session_state.translated_debug_info["glossary_term_count"] = len(glossary_entries)
 
-    if debug_mode and st.session_state.translated_debug_info:
+    if current_result_available:
+        st.session_state.translated_file_name = build_output_filename(uploaded_file.name)
+        progress_placeholder.progress(1.0)
+        status_placeholder.success("Translation complete.")
+    else:
+        progress_placeholder.empty()
+        if st.session_state.entra_auth_ready:
+            status_placeholder.info(
+                "Review the suggested glossary candidates above, then click Translate PowerPoint."
+            )
+        else:
+            status_placeholder.info(
+                "Review the suggested glossary candidates above, click Check Microsoft Entra sign-in, then start translation."
+            )
+
+    if current_result_available and debug_mode and st.session_state.translated_debug_info:
         show_debug_panel(st.session_state.translated_debug_info, used_cached_result)
 
-    if st.session_state.translated_file_bytes:
+    if current_result_available and st.session_state.translated_file_bytes:
         show_download_button(
             st.session_state.translated_file_bytes,
             st.session_state.translated_file_name,
